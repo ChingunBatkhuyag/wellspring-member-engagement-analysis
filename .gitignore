@@ -1,0 +1,7 @@
+rstudio-export/
+data/
+*.csv
+*.xlsx
+.RData
+.Rhistory
+.Rproj.user/
