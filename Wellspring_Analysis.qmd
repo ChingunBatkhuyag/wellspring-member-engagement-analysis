@@ -1,0 +1,381 @@
+---
+title: "Evaluating Attendance at Wellspring"
+subtitle: "Registration system, age, and cancer type"
+author: ""
+institute: ""
+format:
+  beamer:
+    aspectratio: 169
+    theme: Madrid
+    colortheme: default
+    fontsize: 10pt
+    slide-level: 2
+    keep-tex: false
+execute:
+  echo: false
+  warning: false
+  message: false
+  cache: false
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(lubridate)
+library(scales)
+library(broom)
+
+members_raw <- read_csv("~/Desktop/STA130 Final Project/rstudio-export/Member_Background.csv")
+services_raw <- read_csv("~/Desktop/STA130 Final Project/rstudio-export/Service_Deliveries.csv")
+purple <- "#5945A8"
+lavender <- "#B9A9DC"
+coral <- "#D66F7C"
+blue <- "#589ABF"
+plot_theme <- theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", size = 12),
+        panel.grid.minor = element_blank(),
+        legend.position = "bottom")
+
+# Month-level registration dates: March 2024 is classified before
+members <- members_raw %>%
+  mutate(registration_date = make_date(member_start_year, member_start_month, 1))
+services <- services_raw %>%
+  mutate(event_date = make_date(delivery_year, delivery_month, delivery_day))
+
+# RQ1: A member attended if there is at least one Present event from
+# registration day through day 30 (inclusive).
+registration <- members %>%
+  filter(!is.na(registration_date)) %>%
+  left_join(services, by = "member_id") %>%
+  mutate(days_since = as.numeric(event_date - registration_date)) %>%
+  group_by(member_id, registration_date) %>%
+  summarise(
+    has_records = any(!is.na(event_date)),
+    attended_30 = any(attendance_status == "Present" &
+                        days_since >= 0 & days_since <= 30, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    attended_status = case_when(
+      !has_records ~ "No Data",
+      attended_30 ~ "Attended",
+      TRUE ~ "Did Not Attend"
+    ),
+    implementation_group = factor(
+      if_else(registration_date < ymd("2024-03-04"), "Before", "After"),
+      levels = c("Before", "After")
+    )
+  )
+
+rq1_valid <- registration %>% filter(attended_status != "No Data")
+rq1_counts <- rq1_valid %>%
+  count(implementation_group, attended_status, name = "n") %>%
+  complete(implementation_group,
+           attended_status = c("Attended", "Did Not Attend"),
+           fill = list(n = 0)) %>%
+  group_by(implementation_group) %>%
+  mutate(total = sum(n), share = n / total) %>%
+  ungroup()
+
+rq1_all <- registration %>%
+  count(implementation_group, attended_status, name = "n") %>%
+  complete(implementation_group,
+           attended_status = c("Attended", "Did Not Attend", "No Data"),
+           fill = list(n = 0)) %>%
+  group_by(implementation_group) %>%
+  mutate(total = sum(n), share = n / total) %>%
+  ungroup()
+
+attended_n <- rq1_counts %>% filter(attended_status == "Attended") %>% arrange(implementation_group)
+# prop.test reports an asymptotic confidence interval for before-minus-after.
+rq1_test <- prop.test(x = attended_n$n, n = attended_n$total, correct = FALSE)
+rq1_before <- attended_n$share[1]
+rq1_after <- attended_n$share[2]
+rq1_gap <- 100 * (rq1_before - rq1_after)
+rq1_no_data <- rq1_all %>%
+  filter(attended_status == "No Data") %>%
+  arrange(implementation_group) %>% pull(share)
+
+# RQ2 and RQ3: attendance among recorded service registrations.
+member_rates <- members %>%
+  left_join(services, by = "member_id") %>%
+  group_by(member_id) %>%
+  summarise(
+    age_years = first(age_years),
+    types_of_cancer = first(types_of_cancer),
+    total_events = sum(!is.na(attendance_status)),
+    attended_events = sum(attendance_status == "Present", na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(total_events > 0) %>%
+  mutate(attendance_rate = 100 * attended_events / total_events)
+
+age_missing <- sum(is.na(member_rates$age_years))
+age_zero <- sum(member_rates$age_years == 0, na.rm = TRUE)
+age_data <- member_rates %>% filter(!is.na(age_years), age_years > 0, age_years <= 120)
+age_model <- lm(attendance_rate ~ age_years, data = age_data)
+age_coef <- tidy(age_model) %>% filter(term == "age_years")
+age_r2 <- glance(age_model)$r.squared
+
+# Cancer types can be multiple per member; membership is not exclusive.
+members_long <- member_rates %>%
+  mutate(types_of_cancer = strsplit(as.character(types_of_cancer), ";")) %>%
+  unnest(types_of_cancer) %>%
+  mutate(types_of_cancer = trimws(types_of_cancer)) %>%
+  filter(!is.na(types_of_cancer), types_of_cancer != "", types_of_cancer != "Other")
+cancer_counts <- members_long %>% count(types_of_cancer, sort = TRUE)
+top_two <- head(cancer_counts, 2)$types_of_cancer
+bottom_two <- tail(cancer_counts, 2)$types_of_cancer
+cancer_data <- members_long %>%
+  filter(types_of_cancer %in% c(top_two, bottom_two)) %>%
+  mutate(
+    category = if_else(types_of_cancer %in% top_two, "Most prevalent", "Least prevalent"),
+    types_of_cancer = factor(types_of_cancer, levels = c(top_two, bottom_two))
+  )
+cancer_summary <- cancer_data %>%
+  group_by(types_of_cancer, category) %>%
+  summarise(n = n(), mean = mean(attendance_rate), median = median(attendance_rate),
+            .groups = "drop")
+
+# Exact p value generated from the supplied data (not read from a screenshot).
+# For ties, base R will use an asymptotic approximation.
+cancer_test <- wilcox.test(attendance_rate ~ category, data = cancer_data,
+                          exact = FALSE)
+rare_n <- sum(cancer_summary$n[cancer_summary$category == "Least prevalent"])
+
+fmt_pct <- function(x, digits = 0) paste0(formatC(100 * x, digits = digits, format = "f"), "%")
+fmt_p <- function(x) if (x < .001) "< 0.001" else sprintf("%.3f", x)
+```
+
+## Executive summary
+
+::: columns
+::: {.column width="33%"}
+**Registration system**
+
+**`r fmt_pct(rq1_before)` → `r fmt_pct(rq1_after)`**
+
+First-month attendance was lower after implementation, among members with records.
+:::
+::: {.column width="33%"}
+**Age**
+
+**`r sprintf("%.2f", age_coef$estimate)` points / year**
+
+Age explains only **`r sprintf("%.1f", 100 * age_r2)`%** of attendance variation.
+:::
+::: {.column width="33%"}
+**Cancer type**
+
+**Wilcoxon p = `r fmt_p(cancer_test$p.value)`**
+
+Pooled comparison: `r if (cancer_test$p.value < .05) "statistically significant" else "not statistically significant"`; the rare groups are small.
+:::
+:::
+
+**Priority:** Improve the completeness and comparability of registration and attendance records before drawing causal conclusions or targeting outreach by demographics.
+
+## Context and data: Measuring member participation
+
+**Wellspring** provides support programs and services for people affected by cancer. It introduced a new registration system on **March 4, 2024** and expanded online programming.
+
+::: columns
+::: {.column width="50%"}
+**Questions**
+
+1. Did first-month attendance differ before versus after implementation?
+2. Does age predict attendance rate?
+3. Do the most and least prevalent cancer types have different attendance rates?
+:::
+::: {.column width="50%"}
+**Data used**
+
+- Member file: member ID, age, cancer type, registration month
+- Service file: member ID, event date, attendance status
+- Service attendance rate = Present events ÷ recorded events
+:::
+:::
+
+*Observational analysis: the results describe associations, not the causal impact of the system.*
+
+## RQ1: First-month attendance was lower after implementation
+
+**Question:** Did the share attending at least one event within 30 days differ across implementation groups?
+
+**Method:** Two-sample proportion test; members with **No Data excluded** from the primary comparison.
+
+::: columns
+::: {.column width="49%"}
+```{r rq1_chart, fig.width=5.6, fig.height=3.2}
+rq1_counts %>%
+  mutate(attended_status = factor(attended_status, levels = c("Attended", "Did Not Attend"))) %>%
+  ggplot(aes(implementation_group, share, fill = attended_status)) +
+  geom_col(width = .58) +
+  geom_text(aes(label = paste0(round(share * 100), "% (n=", n, ")")),
+            position = position_stack(vjust = .5), size = 3.0) +
+  scale_y_continuous(labels = percent, limits = c(0, 1), expand = expansion(mult = c(0, 0))) +
+  scale_fill_manual(values = c("Attended" = purple, "Did Not Attend" = lavender)) +
+  labs(x = NULL, y = "Members (%)", fill = "Attendance", subtitle = "Excluding 'No Data'") +
+  plot_theme
+```
+:::
+::: {.column width="49%"}
+**Before:** `r fmt_pct(rq1_before)` attended
+
+**After:** `r fmt_pct(rq1_after)` attended
+
+**Difference:** `r sprintf("%.1f", rq1_gap)` percentage points
+
+95% CI: `r sprintf("%.1f", 100 * rq1_test$conf.int[1])` to `r sprintf("%.1f", 100 * rq1_test$conf.int[2])` points
+
+$\chi^2$ = `r sprintf("%.2f", unname(rq1_test$statistic))`; p `r fmt_p(rq1_test$p.value)`
+:::
+:::
+
+## RQ1: Missing records complicate the before/after comparison
+
+::: columns
+::: {.column width="55%"}
+```{r rq1_missing_chart, fig.width=6.1, fig.height=3.4}
+rq1_all %>%
+  mutate(attended_status = factor(attended_status,
+           levels = c("Attended", "Did Not Attend", "No Data"))) %>%
+  ggplot(aes(implementation_group, share, fill = attended_status)) +
+  geom_col(width = .58) +
+  geom_text(aes(label = if_else(share >= .065, paste0(round(share * 100), "%"), "")),
+            position = position_stack(vjust = .5), size = 3.2) +
+  scale_y_continuous(labels = percent, limits = c(0, 1), expand = expansion(mult = c(0, 0))) +
+  scale_fill_manual(values = c("Attended" = purple,
+                               "Did Not Attend" = lavender, "No Data" = coral)) +
+  labs(x = NULL, y = "Members (%)", fill = "Attendance", subtitle = "Including 'No Data'") +
+  plot_theme
+```
+:::
+::: {.column width="43%"}
+**No Data:** `r fmt_pct(rq1_no_data[1])` before versus `r fmt_pct(rq1_no_data[2])` after.
+
+- After-period members have shorter potential follow-up.
+- Missing or delayed service records may affect the comparison.
+- Dates are **month-level**; everyone registered in March 2024 is counted as **Before**.
+
+**Interpretation:** The observed decline does **not** establish that the new system caused it.
+:::
+:::
+
+## RQ2: Age is statistically associated with attendance, but weakly
+
+**Method:** Member-level linear regression of service attendance rate (%) on age (years).
+
+::: columns
+::: {.column width="59%"}
+```{r age_chart, fig.width=6.3, fig.height=3.6}
+ggplot(age_data, aes(age_years, attendance_rate)) +
+  geom_point(alpha = .28, size = .9, color = blue) +
+  geom_smooth(method = "lm", se = FALSE, color = coral, linewidth = 1.1) +
+  scale_y_continuous(labels = function(x) paste0(x, "%"), limits = c(0, 100)) +
+  labs(x = "Age (years)", y = "Attendance rate (%)") +
+  plot_theme
+```
+:::
+::: {.column width="39%"}
+**Each additional year:** `r sprintf("%+.2f", age_coef$estimate)` percentage points (p = `r fmt_p(age_coef$p.value)`).
+
+**10 years:** `r sprintf("%+.1f", 10 * age_coef$estimate)` points.
+
+**$R^2$:** `r sprintf("%.4f", age_r2)` (about `r sprintf("%.1f", 100 * age_r2)`% of variation).
+
+**Sample:** `r nrow(age_data)` of `r nrow(member_rates)` members with service records.
+
+Missing age: `r age_missing`; age 0: `r age_zero`.
+:::
+:::
+
+*Age alone is too weak a predictor to justify age-based outreach.*
+
+## RQ3: Cancer-type differences need cautious interpretation
+
+**Method:** Compare two most versus two least prevalent types using member attendance rates; Wilcoxon rank-sum test on pooled groups.
+
+::: columns
+::: {.column width="53%"}
+```{r cancer_chart, fig.width=6, fig.height=3.5}
+ggplot(cancer_data, aes(types_of_cancer, attendance_rate, fill = category)) +
+  geom_boxplot(outlier.alpha = .45, width = .58) +
+  scale_y_continuous(labels = function(x) paste0(x, "%"), limits = c(0, 100)) +
+  scale_fill_manual(values = c("Most prevalent" = blue, "Least prevalent" = coral)) +
+  labs(x = NULL, y = "Attendance rate (%)", fill = "Group") +
+  coord_flip() + plot_theme
+```
+:::
+::: {.column width="45%"}
+```{r cancer_table, results='asis'}
+library(knitr)
+
+cancer_summary |>
+  mutate(
+    `Cancer type` = case_when(
+      types_of_cancer == "Gallbladder and Bile Duct" ~
+        "Gallbladder/Bile Duct",
+      TRUE ~ as.character(types_of_cancer)
+    ),
+    Mean = sprintf("%.1f%%", mean),
+    Median = sprintf("%.1f%%", median)
+  ) |>
+  select(`Cancer type`, n, Mean, Median) |>
+  knitr::kable(
+    format = "html",
+    escape = FALSE,
+    table.attr = 'style="font-size: 14px; width: 95%; table-layout: auto;"'
+  )
+```
+
+**Wilcoxon p = `r fmt_p(cancer_test$p.value)`** — `r if (cancer_test$p.value < .05) "statistically significant at 5%; interpret carefully" else "not significant at 5%"`.
+
+Least-prevalent groups: **`r rare_n` observations combined**.
+:::
+:::
+
+*Differences in sample means are descriptive; they do not establish significant pairwise differences.*
+
+## Limitations
+
+1. **Month level dates.** Registration days are unavailable. March 2024 registrations are all classified Before, although the change happened March 4.
+
+2. **Missing and unequal follow-up.** No Data is more common in the After group, which also has less time for attendance to be observed.
+
+3. **Incomplete age records.** `r age_missing` of `r nrow(member_rates)` members with recorded services lack age (`r sprintf("%.1f", 100 * age_missing/nrow(member_rates))`%); `r age_zero` have age 0.
+
+4. **Small cancer subgroups and observational design.** Only `r rare_n` observations are in the two least prevalent groups; unmeasured differences may affect every comparison.
+
+## Recommendations: Improve evidence before targeting outreach
+
+**1 Highest priority — Audit registration and service records.**
+
+Investigate missing attendance statuses, delayed entries, and whether post-implementation members have adequate follow-up. Preserve exact registration dates where possible.
+
+**2 Next — Monitor comparable cohorts.**
+
+Track a consistent 30-day attendance outcome only after each new member has had enough follow-up. Repeat the before/after analysis once the data are more complete.
+
+**3 Then — Investigate participation barriers.**
+
+Explore scheduling, accessibility, program preferences, and reminder processes. Do not target by age alone or infer rare-cancer needs from tiny samples.
+
+## Conclusion
+
+- **Registration:** First-month attendance differs before versus after implementation, but missing records and unequal observation windows prevent a causal claim.
+
+- **Age:** A statistically detectable positive relationship has very little explanatory power in practice.
+
+- **Cancer type:** Results are descriptive and `r if (cancer_test$p.value < .05) "the pooled test is statistically significant, though sample imbalance limits interpretation" else "the pooled Wilcoxon test does not show a statistically significant difference"`; rare groups cannot support strong recommendations.
+
+**Takeaway:** Better tracking is the most actionable immediate step for Wellspring.
+
+## Appendix: Definitions, exclusions, and statistical checks
+
+- **RQ1 outcome:** Attended at least one event marked `Present` during days 0–30 after the approximated registration date. Main comparison excludes `No Data` (no dated service record).
+- **Implementation groups:** Before = registration date earlier than March 4, 2024. Dates use the **first day of each recorded month**, therefore March is Before.
+- **RQ2/RQ3 attendance rate:** `100 × (# events marked Present / # recorded attendance statuses)` per member; excludes members with no service attendance statuses.
+- **Age regression:** Ages missing, 0, or over 120 are excluded.
+- **RQ3 categories:** Split semicolon-separated cancer types; exclude blank/Other; most/least prevalent chosen by counts among members with service records. Members with more than one type may appear multiple times.
+- **Tests:** Two-sample proportion test (RQ1), OLS regression (RQ2), pooled Wilcoxon rank-sum test (RQ3). All statistics are computed when this file renders.
+
